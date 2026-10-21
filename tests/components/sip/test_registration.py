@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from .common import _load_component_module, sip_client, sm
+from .common import _load_component_module, sip_client, sm, wait_for
 from .mock_pbx import MockPbx
 
 # These tests drive real UDP sockets on 127.0.0.1 (mock PBX / RTP peers).
@@ -212,7 +212,6 @@ def test_register_refresh_at_half_expiration():
 
     registered, delays = asyncio.run(run())
     assert registered == [True]
-    # 200 OK schedules a refresh at expiration/2 (floored at 30s).
     assert delays[-1] == 60
 
 
@@ -246,43 +245,6 @@ def test_register_refresh_keeps_registered_state():
     assert after == before
     assert state == sip_client.SipState.REGISTERED
     assert pending is False
-
-
-def test_register_deferred_during_call():
-
-    async def run():
-        pbx = MockPbx()
-        await pbx.start()
-        client, registered, _failed = await _make_client(pbx)
-        try:
-            await client.start()
-            for _ in range(20):
-                if registered:
-                    break
-                await asyncio.sleep(0.02)
-            before = len(pbx.registers)
-            client.state = sip_client.SipState.IN_CALL
-            delays = []
-            real = client._schedule_register
-
-            def spy(seconds):
-                delays.append(seconds)
-                real(3600)
-
-            client._schedule_register = spy
-            client._register_tick()
-            during = len(pbx.registers)
-            client.state = sip_client.SipState.REGISTERED
-            client._register_tick()
-            await asyncio.sleep(0.05)
-            return before, during, len(pbx.registers), delays
-        finally:
-            await _stop(client, pbx)
-
-    before, during, after, delays = asyncio.run(run())
-    assert during == before
-    assert delays[0] == 30
-    assert after > before
 
 
 def test_register_recovers_after_pbx_restart():
@@ -542,3 +504,59 @@ def test_harness_reinvite_answers_with_new_transaction():
     assert replies
     assert "CSeq: 2 INVITE\r\n" in replies[-1]
     assert "Content-Type: application/sdp" in replies[-1]
+
+
+def test_registrar_expiry_is_refreshed_without_interrupting_a_call():
+    async def run():
+        pbx = MockPbx()
+        pbx.max_expires = 40
+        await pbx.start()
+        client, _registered, _failed = await _make_client(pbx, register_expiration=300)
+        try:
+            await client.start()
+            await wait_for(lambda: client.registered)
+            remaining = (
+                client._register_handle.when() - asyncio.get_running_loop().time()
+            )
+            assert 0 < remaining <= 20
+            client.call("2000")
+            await wait_for(lambda: client.in_call)
+            call_id = client._d_call_id
+            before = len(pbx.registers)
+            fire_register_timer(client)
+            await wait_for(
+                lambda: len(pbx.registers) > before and not client._reg_pending
+            )
+            assert client.in_call
+            assert client._d_call_id == call_id
+            assert client.registered
+        finally:
+            await _stop(client, pbx)
+
+    asyncio.run(run())
+
+
+def test_registration_uses_own_contact_expiry_and_rejects_removed_binding():
+    async def run():
+        client = sip_client.SipClient(sip_client.SipConfig("pbx.example"))
+        client.state = sip_client.SipState.REGISTERING
+        client._reg_contact_sent = "<sip:100@192.0.2.1:5090>"
+        delays = []
+        client._schedule_register = delays.append
+        response = sm.parse_sip_message(
+            "SIP/2.0 200 OK\r\nCSeq: 0 REGISTER\r\n"
+            "Contact: <sip:100@192.0.2.2:5090>;expires=2\r\n"
+            "Contact: <sip:100@192.0.2.1:5090>;expires=50\r\n"
+            "Expires: 300\r\nContent-Length: 0\r\n\r\n"
+        )
+        try:
+            client._handle_register_response(response)
+            assert client.registered
+            assert delays == [25]
+            response.headers["contact"] = client._reg_contact_sent + ";expires=0"
+            client._handle_register_response(response)
+            assert not client.registered
+        finally:
+            await client.stop()
+
+    asyncio.run(run())

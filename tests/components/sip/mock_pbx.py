@@ -75,6 +75,7 @@ class MockPbx:
         self.require_auth = True
         self.challenge = "www"  # "www" → 401, "proxy" → 407
         self.min_expires = 0
+        self.max_expires = 0
         self.drop = False
         self.force_code: int | None = None
         self.auto_answer_invite = True
@@ -215,7 +216,12 @@ class MockPbx:
         if self.require_auth and not self._valid_digest(msg, "REGISTER"):
             self.send_raw(self._challenge(msg), addr)
             return
-        extra = f"Contact: {msg.header('Contact')}\r\nExpires: {expires or 300}\r\n"
+        granted = (
+            min(expires or 300, self.max_expires)
+            if self.max_expires
+            else expires or 300
+        )
+        extra = f"Contact: {msg.header('Contact')};expires={granted}\r\nExpires: {granted}\r\n"
         self.send_raw(self._response(msg, 200, "OK", extra), addr)
 
     def _handle_invite(self, msg: sm.SipMessage, addr) -> None:

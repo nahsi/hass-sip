@@ -71,7 +71,7 @@ _COMPACT_HEADERS = {
     "v": "via",
 }
 
-_COMMA_LIST_HEADERS = {"record-route", "route", "service-route", "via"}
+_COMMA_LIST_HEADERS = {"contact", "record-route", "route", "service-route", "via"}
 
 
 def split_header_values(value: str) -> list[str]:

@@ -674,6 +674,8 @@ class SipClient:
                 self._register_handle = None
             self.registered = False
             self._reg_pending = False
+            if self.state in _DIALOG_STATES:
+                self._end_call("connection_lost")
             if self._transport is not None:
                 self._transport.close()
                 self._transport = None
@@ -847,7 +849,7 @@ class SipClient:
         # A refresh of a live registration stays REGISTERED: the registrar
         # still holds the binding, and flipping to REGISTERING every half
         # expiry would churn state-change events for nothing.
-        if self.state != SipState.REGISTERED:
+        if self.state in (SipState.IDLE, SipState.REGISTERING):
             self._set_state(SipState.REGISTERING)
         self._schedule_register(5)  # retry window if no response
 
@@ -869,16 +871,6 @@ class SipClient:
             self._schedule_register(10)
 
     def _register_tick(self) -> None:
-        # Don't disturb an active call; defer the refresh.
-        if self.state in (
-            SipState.IN_CALL,
-            SipState.ANSWERING,
-            SipState.INCOMING,
-            SipState.INVITING,
-            SipState.RINGING_OUT,
-        ):
-            self._schedule_register(30)
-            return
         if self._reg_pending or self.state == SipState.REGISTERING:
             # No response in the window. Resend a few times, then rebuild the
             # socket to recover from a dead transport or a changed local IP.
@@ -889,7 +881,7 @@ class SipClient:
                 self._request_reconnect()
             else:
                 self._do_register()
-        elif self.state == SipState.REGISTERED:
+        elif self._transport is not None:
             self._do_register()  # periodic refresh
         else:  # IDLE: the socket is likely gone, rebuild it
             self._request_reconnect()
@@ -940,6 +932,29 @@ class SipClient:
             ),
         )
 
+    def _registration_expiration(self, message: sm.SipMessage) -> int:
+        value = message.header("Expires")
+        sent_uri = _angle_uri(self._reg_contact_sent)
+        for contact in sm.split_header_values(message.header("Contact")):
+            uri = _angle_uri(contact)
+            if uri == sent_uri:
+                parameters = contact.partition(">")[2]
+            elif sent_uri and "<" not in contact and uri.startswith(sent_uri + ";"):
+                parameters = uri[len(sent_uri) :]
+            else:
+                continue
+            match = re.search(
+                r"(?:^|;)\s*expires\s*=\s*(\d+)\s*(?:;|$)", parameters, re.IGNORECASE
+            )
+            if match:
+                value = match[1]
+            break
+        try:
+            expiration = int(value)
+        except ValueError:
+            return self.config.register_expiration
+        return expiration if expiration >= 0 else self.config.register_expiration
+
     def _handle_register_response(self, m: sm.SipMessage) -> None:
         try:
             cseq_num = int(m.header("CSeq").split()[0])
@@ -985,6 +1000,12 @@ class SipClient:
             )
             return
         if 200 <= m.status_code < 300:
+            expiration = self._registration_expiration(m)
+            if expiration == 0:
+                self._retry_after_register_failure(
+                    m.status_code, "Registration binding expired"
+                )
+                return
             was = self.registered
             self.registered = True
             self.last_register_failed = None
@@ -995,7 +1016,7 @@ class SipClient:
             # A refresh may now overlap a call; never clobber a call state.
             if self.state == SipState.REGISTERING:
                 self._set_state(SipState.REGISTERED)
-            self._schedule_register(max(self.config.register_expiration // 2, 30))
+            self._schedule_register(expiration / 2)
             if sr := m.header("Service-Route"):
                 self._service_routes = sr
             if not was:
