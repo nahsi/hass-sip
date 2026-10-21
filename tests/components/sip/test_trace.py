@@ -150,6 +150,18 @@ def test_mask_sip_password_param():
     assert 'password="****"' in out
 
 
+def test_trace_does_not_disclose_sdes_keys(caplog):
+    key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwd"
+    message = _INVITE + (
+        "m=audio 4000 RTP/SAVP 0\r\n"
+        f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{key}|2^31\r\n"
+    )
+    with caplog.at_level(logging.DEBUG, logger=trace._LOGGER.name):
+        trace.log_sip("TX", message)
+    assert "INVITE sip:200@pbx.example" in caplog.text
+    assert key not in caplog.text
+
+
 def test_log_sip_skips_masking_when_disabled():
     with patch.object(trace, "mask_sip", wraps=trace.mask_sip) as mask:
         with patch.object(trace._LOGGER, "debug") as debug:

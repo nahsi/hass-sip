@@ -25,6 +25,7 @@ from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.service import async_extract_config_entry_ids
+from homeassistant.util.ssl import client_context
 
 from .assist import AssistBridge
 from .assist_gate import (
@@ -41,6 +42,7 @@ from .const import (
     CONF_PASSWORD,
     CONF_PORT,
     CONF_REGISTER_EXPIRATION,
+    CONF_SECURITY_MODE,
     CONF_SERVER,
     CONF_USERNAME,
     CONF_OUTBOUND_PROXY,
@@ -87,7 +89,13 @@ from .repairs import (
     should_open_auth_repair,
 )
 from .sip_client.audio import FfmpegAudioSource
-from .sip_client.sip_client import SipCallbacks, SipClient, SipConfig, SipState
+from .sip_client.sip_client import (
+    SipCallbacks,
+    SipClient,
+    SipConfig,
+    SipSecurityMode,
+    SipState,
+)
 from .sip_client.trace import mask_number
 
 
@@ -264,15 +272,12 @@ SERVICE_ASSIST_SCHEMA = cv.make_entity_service_schema(
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up SIP Client from a config entry."""
     config = entry.data
-    LOGGER.info(
-        "Setting up SIP account %s@%s:%s",
-        config[CONF_USERNAME],
-        config[CONF_SERVER],
-        config.get(CONF_PORT, 5060),
-    )
     sip_config = SipConfig(
         server=config[CONF_SERVER],
-        port=config.get(CONF_PORT, 5060),
+        port=config.get(CONF_PORT),
+        security_mode=SipSecurityMode(
+            config.get(CONF_SECURITY_MODE, SipSecurityMode.UDP_RTP)
+        ),
         username=config[CONF_USERNAME],
         password=config[CONF_PASSWORD],
         auth_username=config.get(CONF_AUTH_USERNAME, ""),
@@ -289,6 +294,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         use_observed_address=config.get(
             CONF_USE_OBSERVED_ADDRESS, DEFAULT_USE_OBSERVED_ADDRESS
         ),
+    )
+    LOGGER.info(
+        "Setting up SIP account %s@%s:%s",
+        sip_config.username,
+        sip_config.server,
+        sip_config.port,
     )
 
     # Load contacts asynchronously from file to avoid blocking event loop on startup
@@ -584,7 +595,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         on_codec_change=on_codec_change,
     )
 
-    client = SipClient(sip_config, callbacks)
+    client = SipClient(
+        sip_config,
+        callbacks,
+        ssl_context=(
+            client_context()
+            if sip_config.security_mode is SipSecurityMode.TLS_SRTP
+            else None
+        ),
+    )
     entry.runtime_data["client"] = client
     client.auto_answer_checker = lambda num: get_contact_info_from_cache(
         entry.runtime_data.get("contacts", {}), num

@@ -32,6 +32,9 @@ class SdpInfo:
     valid: bool = False
     connection_ip: str = ""
     audio_port: int = 0
+    media_profile: str = ""
+    crypto: list[str] = field(default_factory=list, repr=False)
+    audio_count: int = 0
     pcmu_pt: int = -1
     pcma_pt: int = -1
     g722_pt: int = -1
@@ -153,22 +156,28 @@ def parse_sip_message(raw: str) -> SipMessage:
 
 def parse_sdp(body: str) -> SdpInfo:
     info = SdpInfo()
+    in_media = False
+    in_audio = False
     for raw_line in body.replace("\r\n", "\n").split("\n"):
         line = raw_line.strip()
         if not line:
             continue
-        if line.startswith("c=IN IP"):
-            info.connection_ip = line.rsplit(" ", 1)[-1].strip()
-        elif line.startswith("m=audio "):
+        if line.startswith("m="):
+            in_media = True
+            tokens = line[2:].split()
+            is_audio = bool(tokens) and tokens[0] == "audio"
+            if is_audio:
+                info.audio_count += 1
+            in_audio = is_audio and info.audio_count == 1
+            if not in_audio or len(tokens) < 3:
+                continue
             info.valid = True
-            rest = line[8:]
-            tokens = rest.split()
-            if tokens:
-                try:
-                    info.audio_port = int(tokens[0])
-                except ValueError:
-                    info.audio_port = 0
-            pts = tokens[2:] if len(tokens) > 2 else []
+            info.media_profile = tokens[2]
+            try:
+                info.audio_port = int(tokens[1])
+            except ValueError:
+                info.audio_port = 0
+            pts = tokens[3:]
             for tok in pts:
                 try:
                     info.offered_pts.add(int(tok))
@@ -180,7 +189,13 @@ def parse_sdp(body: str) -> SdpInfo:
                 info.pcma_pt = 8
             if "9" in pts:
                 info.g722_pt = 9
-        elif line.startswith("a=rtpmap:"):
+        elif in_media and not in_audio:
+            continue
+        elif line.startswith("c=IN IP"):
+            info.connection_ip = line.rsplit(" ", 1)[-1].strip()
+        elif in_audio and line.startswith("a=crypto:"):
+            info.crypto.append(line[len("a=crypto:") :])
+        elif in_audio and line.startswith("a=rtpmap:"):
             m = re.match(r"a=rtpmap:(\d+)", line)
             if not m:
                 continue

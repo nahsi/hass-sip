@@ -6,6 +6,7 @@
         "description": "SIP 내선 정보 및 서버 설정을 입력해 주세요.",
         "data": {
           "server": "SIP 서버 주소 / 호스트",
+          "security_mode": "연결 보안",
           "port": "포트",
           "username": "사용자명 / 내선번호",
           "password": "비밀번호",
@@ -20,6 +21,8 @@
           "use_observed_address": "서버에서 관측된 주소 사용 (NAT)"
         },
         "data_description": {
+          "port": "비워 두면 모드의 기본 포트인 UDP 5060 또는 TLS 5061을 사용합니다. 지정한 포트는 모드를 변경해도 유지됩니다.",
+          "security_mode": "TLS는 서버 인증서와 호스트 이름을 검증하며 SRTP로 암호화된 오디오를 필수로 사용합니다. 서버가 둘 다 지원해야 합니다.",
           "use_observed_address": "Home Assistant가 SIP 서버와의 사이에 NAT/SNAT(예: 출발지 주소를 변환하는 방화벽) 뒤에 있고 통화에 소리가 없을 때 사용하세요. 로컬 인터페이스 주소 대신 서버가 보는 주소(Via received/rport)를 Contact와 SDP에 알립니다."
         }
       },
@@ -28,6 +31,7 @@
         "description": "SIP 내선 정보 및 서버 설정을 수정해 주세요. 비밀번호를 비워 두면 기존 값을 유지합니다.",
         "data": {
           "server": "SIP 서버 주소 / 호스트",
+          "security_mode": "연결 보안",
           "port": "포트",
           "username": "사용자명 / 내선번호",
           "password": "비밀번호",
@@ -42,6 +46,8 @@
           "use_observed_address": "서버에서 관측된 주소 사용 (NAT)"
         },
         "data_description": {
+          "port": "비워 두면 모드의 기본 포트인 UDP 5060 또는 TLS 5061을 사용합니다. 지정한 포트는 모드를 변경해도 유지됩니다.",
+          "security_mode": "TLS는 서버 인증서와 호스트 이름을 검증하며 SRTP로 암호화된 오디오를 필수로 사용합니다. 서버가 둘 다 지원해야 합니다.",
           "use_observed_address": "Home Assistant가 SIP 서버와의 사이에 NAT/SNAT(예: 출발지 주소를 변환하는 방화벽) 뒤에 있고 통화에 소리가 없을 때 사용하세요. 로컬 인터페이스 주소 대신 서버가 보는 주소(Via received/rport)를 Contact와 SDP에 알립니다."
         }
       }
@@ -352,6 +358,12 @@
     }
   },
   "selector": {
+    "security_mode": {
+      "options": {
+        "udp_rtp": "UDP 및 RTP",
+        "tls_srtp": "TLS 및 필수 SRTP"
+      }
+    },
     "codec_preference": {
       "options": {
         "auto": "자동 (G.722 → PCMU → PCMA)",

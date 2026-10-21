@@ -88,6 +88,8 @@ def mask_sip(msg: str) -> str:
                 stripped = basic
             else:
                 stripped = _SECRET_PARAM.sub(_redact_param, stripped)
+        elif lower.startswith("a=crypto:"):
+            stripped = f"a=crypto:{REDACTED}"
         parts.append(lead + stripped + ending)
     return "".join(parts)
 

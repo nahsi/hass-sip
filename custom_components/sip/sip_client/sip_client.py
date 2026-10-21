@@ -14,6 +14,7 @@ import ipaddress
 import logging
 import re
 import socket
+import ssl
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Coroutine
@@ -24,6 +25,8 @@ from . import trace
 from .audio import AudioSink, AudioSource, NullSink, TeeSink
 from .rtp_session import RtpSession
 from .sip_auth import digest_response
+from .sip_transport import CONNECT_TIMEOUT, HANDSHAKE_TIMEOUT, SipTlsProtocol
+from .srtp import SdesCrypto, SrtpSession, parse_crypto
 
 _LOGGER = logging.getLogger(__name__)
 USER_AGENT = "HomeAssistant-sip_client"
@@ -47,10 +50,15 @@ class SipState(enum.StrEnum):
     IN_CALL = "in_call"
 
 
+class SipSecurityMode(enum.StrEnum):
+    UDP_RTP = "udp_rtp"
+    TLS_SRTP = "tls_srtp"
+
+
 @dataclass
 class SipConfig:
     server: str
-    port: int = 5060
+    port: int | None = None
     username: str = ""
     password: str = ""
     auth_username: str = ""
@@ -63,6 +71,12 @@ class SipConfig:
     max_call_duration: int = 3600
     codec_preference: str = codecs.DEFAULT_PRESET
     use_observed_address: bool = False
+    security_mode: SipSecurityMode = SipSecurityMode.UDP_RTP
+
+    def __post_init__(self) -> None:
+        self.security_mode = SipSecurityMode(self.security_mode)
+        if self.port is None:
+            self.port = 5061 if self.security_mode == SipSecurityMode.TLS_SRTP else 5060
 
 
 @dataclass
@@ -299,7 +313,11 @@ class _SipProtocol(asyncio.DatagramProtocol):
 
 class SipClient:
     def __init__(
-        self, config: SipConfig, callbacks: SipCallbacks | None = None
+        self,
+        config: SipConfig,
+        callbacks: SipCallbacks | None = None,
+        *,
+        ssl_context: ssl.SSLContext | None = None,
     ) -> None:
         self.config = config
         if not self.config.domain:
@@ -308,7 +326,16 @@ class SipClient:
         self._codec_order = codecs.preset_order(config.codec_preference)
 
         self._loop = asyncio.get_running_loop()
-        self._transport: asyncio.DatagramTransport | None = None
+        self._ssl_context = ssl_context
+        if ssl_context is not None and (
+            not ssl_context.check_hostname
+            or ssl_context.verify_mode != ssl.CERT_REQUIRED
+        ):
+            raise ValueError("SIP TLS requires certificate and hostname verification")
+        self._transport: asyncio.DatagramTransport | asyncio.Transport | None = None
+        self._connection_generation = 0
+        self._opening_task: asyncio.Task | None = None
+        self._reconnect_task: asyncio.Task | None = None
         self._local_ip = ""
         self._warned_observed_ip = ""
         self._observed_ip = ""
@@ -374,6 +401,9 @@ class SipClient:
         self._chosen_pt = self._codec.payload_type
         self._remote_dtmf_pt = -1
         self._sdp_negotiated = False
+        self._local_crypto: SdesCrypto | None = None
+        self._remote_crypto: SdesCrypto | None = None
+        self._srtp_session: SrtpSession | None = None
         self._media_active = False
         self._media_lock = asyncio.Lock()
         self._media_session = 0
@@ -382,6 +412,7 @@ class SipClient:
         self.rtp = RtpSession()
         self.rtp.media_timeout = float(self.config.media_timeout)
         self.rtp.on_media_timeout = self._on_media_timeout
+        self.rtp.on_media_error = self._on_media_error
         self.sink: AudioSink = TeeSink()
         self._tx_source_task: asyncio.Task | None = None
         # A cancelled source may still be cleaning up an ffmpeg subprocess.
@@ -511,6 +542,21 @@ class SipClient:
 
     async def stop(self) -> None:
         self._closing = True
+        self._connection_generation += 1
+        self.registered = False
+        self._reg_pending = False
+        self._media_session += 1
+        self._cancel_max_duration()
+        current = asyncio.current_task()
+        connecting = {
+            task
+            for task in (self._opening_task, self._reconnect_task)
+            if task is not None and task is not current
+        }
+        for task in connecting:
+            task.cancel()
+        if connecting:
+            await asyncio.wait(connecting, timeout=_STOP_DRAIN_TIMEOUT_SEC)
         if self._register_handle is not None:
             self._register_handle.cancel()
             self._register_handle = None
@@ -543,8 +589,82 @@ class SipClient:
         # so stop() does not drop the client while the task is still pending.
         await asyncio.wait(still_pending, timeout=timeout)
 
+    def _request_reconnect(self) -> None:
+        if self._closing:
+            return
+        if self._reconnect_task is None or self._reconnect_task.done():
+            self._reconnect_task = self._spawn(self._reconnect())
+
+    def _tls_lost(self, generation: int) -> None:
+        if self._closing or generation != self._connection_generation:
+            return
+        self._connection_generation += 1
+        self._transport = None
+        self.registered = False
+        self._reg_pending = False
+        if self.state in _DIALOG_STATES:
+            self._end_call("connection_lost")
+        self._set_state(SipState.IDLE)
+        self._request_reconnect()
+
+    async def _open_tls_socket(self, target: str) -> bool:
+        self._connection_generation += 1
+        generation = self._connection_generation
+        task = asyncio.current_task()
+        self._opening_task = task
+        protocol = SipTlsProtocol(
+            lambda packet: (
+                self._on_packet(packet)
+                if generation == self._connection_generation and not self._closing
+                else None
+            ),
+            lambda: self._tls_lost(generation),
+        )
+        transport = None
+        try:
+            async with asyncio.timeout(CONNECT_TIMEOUT):
+                if self._ssl_context is None:
+                    self._ssl_context = await asyncio.to_thread(
+                        ssl.create_default_context
+                    )
+                transport, _ = await self._loop.create_connection(
+                    lambda: protocol,
+                    host=target,
+                    port=self.config.port,
+                    family=socket.AF_INET,
+                    ssl=self._ssl_context,
+                    server_hostname=target,
+                    ssl_handshake_timeout=HANDSHAKE_TIMEOUT,
+                )
+            if (
+                self._closing
+                or generation != self._connection_generation
+                or protocol.closed
+            ):
+                transport.close()
+                return False
+            self._transport = transport
+            local = transport.get_extra_info("sockname")
+            self._local_ip, self._local_port = local[:2]
+            return True
+        except asyncio.CancelledError:
+            if generation == self._connection_generation:
+                self._connection_generation += 1
+            protocol.close()
+            raise
+        except (OSError, TimeoutError, ValueError):
+            if generation == self._connection_generation:
+                self._connection_generation += 1
+            protocol.close()
+            _LOGGER.warning("Verified SIP TLS connection failed")
+            return False
+        finally:
+            if self._opening_task is task:
+                self._opening_task = None
+
     async def _reconnect(self) -> None:
         """Rebuild the SIP socket and re-register (recovers from network loss)."""
+        self._connection_generation += 1
         if self._closing:
             return
         try:
@@ -579,6 +699,8 @@ class SipClient:
             if self.config.outbound_proxy
             else self.config.server
         )
+        if self._secure:
+            return await self._open_tls_socket(target_server)
         # Resolve via the loop so a slow DNS lookup never blocks the event loop.
         try:
             infos = await self._loop.getaddrinfo(
@@ -622,7 +744,10 @@ class SipClient:
             return
         if traced:
             trace.log_sip("TX", msg)
-        self._transport.sendto(msg.encode("utf-8"))
+        if self._secure:
+            self._transport.write(msg.encode("utf-8"))
+        else:
+            self._transport.sendto(msg.encode("utf-8"))
 
     def _emit(self, name: str, *args) -> None:
         """Invoke a user callback, never letting its failure break SIP logic."""
@@ -664,10 +789,19 @@ class SipClient:
             return self._observed_port
         return self._local_port
 
+    @property
+    def _secure(self) -> bool:
+        return self.config.security_mode == SipSecurityMode.TLS_SRTP
+
+    @property
+    def _via_transport(self) -> str:
+        return "TLS" if self._secure else "UDP"
+
     def _contact_uri(self) -> str:
+        transport = ";transport=tls" if self._secure else ""
         return (
             f"<sip:{self.config.username}@{self._advertised_ip}"
-            f":{self._advertised_contact_port}>"
+            f":{self._advertised_contact_port}{transport}>"
         )
 
     @staticmethod
@@ -690,7 +824,7 @@ class SipClient:
         self._reg_contact_sent = self._contact_uri()
         return (
             f"REGISTER {reg_uri} SIP/2.0\r\n"
-            f"Via: SIP/2.0/UDP {self._local_ip}:{self._local_port};branch={self._reg_branch};rport\r\n"
+            f"Via: SIP/2.0/{self._via_transport} {self._local_ip}:{self._local_port};branch={self._reg_branch};rport\r\n"
             "Max-Forwards: 70\r\n"
             f'From: "{disp}" <{aor}>;tag={self._reg_tag}\r\n'
             f"To: <{aor}>\r\n"
@@ -752,13 +886,13 @@ class SipClient:
             if self._reg_attempts >= 3:
                 _LOGGER.warning("REGISTER unanswered; reconnecting socket")
                 self._reg_attempts = 0
-                self._spawn(self._reconnect())
+                self._request_reconnect()
             else:
                 self._do_register()
         elif self.state == SipState.REGISTERED:
             self._do_register()  # periodic refresh
         else:  # IDLE: the socket is likely gone, rebuild it
-            self._spawn(self._reconnect())
+            self._request_reconnect()
 
     def _check_observed_address(self, m: sm.SipMessage) -> None:
         """Log once when the peer sees a different source IP than we advertise.
@@ -988,6 +1122,8 @@ class SipClient:
 
     # -- INVITE retransmission (UDP reliability) ------------------------
     def _start_invite_retx(self) -> None:
+        if self._secure:
+            return
         self._invite_retx_count = 0
         self._schedule_invite_retx(0.5)
 
@@ -1038,6 +1174,12 @@ class SipClient:
         media_line = codecs.sdp_media_line(
             self.config.local_rtp_port, only=only, order=self._codec_order
         )
+        crypto = ""
+        if self._secure:
+            if self._local_crypto is None:
+                raise RuntimeError("Secure SDP has no local key")
+            media_line = media_line.replace("RTP/AVP", "RTP/SAVP")
+            crypto = self._local_crypto.sdp_attribute()
         return (
             "v=0\r\n"
             f"o=- {sid} {sid} IN IP4 {self._advertised_ip}\r\n"
@@ -1045,6 +1187,7 @@ class SipClient:
             f"c=IN IP4 {self._advertised_ip}\r\n"
             "t=0 0\r\n"
             f"{media_line}"
+            f"{crypto}"
             f"{codecs.sdp_rtpmaps(only=only, order=self._codec_order)}"
             "a=fmtp:101 0-15\r\n"
             "a=ptime:20\r\n"
@@ -1055,7 +1198,7 @@ class SipClient:
         sdp = self._local_sdp()
         msg = (
             f"INVITE {self._d_remote_target} SIP/2.0\r\n"
-            f"Via: SIP/2.0/UDP {self._local_ip}:{self._local_port};branch={self._d_branch};rport\r\n"
+            f"Via: SIP/2.0/{self._via_transport} {self._local_ip}:{self._local_port};branch={self._d_branch};rport\r\n"
             "Max-Forwards: 70\r\n"
         )
         if self._service_routes:
@@ -1069,7 +1212,7 @@ class SipClient:
             f"Contact: {self._contact_uri()}\r\n"
             f"User-Agent: {USER_AGENT}\r\n"
             "Content-Type: application/sdp\r\n"
-            f"Content-Length: {len(sdp)}\r\n\r\n"
+            f"Content-Length: {len(sdp.encode('utf-8'))}\r\n\r\n"
             f"{sdp}"
         )
         return msg
@@ -1089,7 +1232,7 @@ class SipClient:
             # ACK to a 2xx response is a new transaction, needs a new branch
             branch = sm.gen_branch()
 
-        via = f"SIP/2.0/UDP {self._local_ip}:{self._local_port};branch={branch};rport"
+        via = f"SIP/2.0/{self._via_transport} {self._local_ip}:{self._local_port};branch={branch};rport"
 
         if self._service_routes and 300 <= resp.status_code < 700:
             route_block = f"Route: {self._service_routes}\r\n"
@@ -1203,19 +1346,21 @@ class SipClient:
             if self._ring_timeout_handle is not None:
                 self._ring_timeout_handle.cancel()
                 self._ring_timeout_handle = None
+            accepted = self._apply_remote_sdp(sm.parse_sdp(m.body), answer=True)
             self._accepted_dialog_to = response_to
             self._d_remote = response_to
             contact_uri = _angle_uri(m.header("Contact"))
             if contact_uri:
                 self._d_remote_target = contact_uri
             self._dialog_routes = response_routes
-            accepted = self._apply_remote_sdp(sm.parse_sdp(m.body))
             self._send_raw(self._build_ack(m))
             if not accepted:
-                _LOGGER.warning("Ending call: the answer has no allowed codec")
+                _LOGGER.warning("Ending call: incompatible SDP answer")
                 self._d_cseq += 1
                 self._send_raw(self._build_in_dialog("BYE"))
-                self._end_call("codec_mismatch")
+                self._end_call(
+                    "security_mismatch" if self._secure else "codec_mismatch"
+                )
                 return
 
             async def _start_and_play():
@@ -1249,9 +1394,52 @@ class SipClient:
             auth += f', opaque="{opaque}"'
         return auth + "\r\n"
 
-    def _apply_remote_sdp(self, sdp: sm.SdpInfo) -> bool:
+    def _select_remote_crypto(
+        self,
+        sdp: sm.SdpInfo,
+        *,
+        answer: bool = False,
+        initial: bool = False,
+    ) -> SdesCrypto | None:
+        if (
+            not sdp.valid
+            or sdp.audio_count != 1
+            or sdp.media_profile != "RTP/SAVP"
+            or not sdp.connection_ip
+            or not 0 < sdp.audio_port <= 65535
+        ):
+            return None
+        candidates = [parse_crypto(value) for value in sdp.crypto]
+        supported = [crypto for crypto in candidates if crypto is not None]
+        if not supported or len({crypto.tag for crypto in supported}) != len(supported):
+            return None
+        if answer:
+            if len(candidates) != 1 or self._local_crypto is None:
+                return None
+            if supported[0].tag != self._local_crypto.tag:
+                return None
+        if not initial and self._sdp_negotiated:
+            if (sdp.connection_ip, sdp.audio_port) != (
+                self._remote_rtp_ip,
+                self._remote_rtp_port,
+            ):
+                return None
+            return next(
+                (crypto for crypto in supported if crypto == self._remote_crypto),
+                None,
+            )
+        if sdp.connection_ip in _HOLD_IPS:
+            return None
+        return supported[0]
+
+    def _apply_remote_sdp(self, sdp: sm.SdpInfo, *, answer: bool = False) -> bool:
         """Adopt the remote SDP. False (nothing changed) when no codec fits."""
         in_dialog = self._sdp_negotiated
+        remote_crypto = None
+        if self._secure:
+            remote_crypto = self._select_remote_crypto(sdp, answer=answer)
+            if remote_crypto is None or self._local_crypto is None:
+                return False
         # First SDP of a dialog picks the preferred codec. Later re-INVITE /
         # UPDATE keep the current one when it is still offered.
         if in_dialog:
@@ -1260,8 +1448,9 @@ class SipClient:
             new_codec = codecs.choose(sdp, self._codec_order)
         if new_codec is None:
             # Keep what the remote offered so diagnostics show the mismatch.
-            self._remote_offered_pts = sorted(sdp.offered_pts)
-            self._remote_offered_names = _offered_codec_names(sdp)
+            if not self._secure:
+                self._remote_offered_pts = sorted(sdp.offered_pts)
+                self._remote_offered_names = _offered_codec_names(sdp)
             _LOGGER.warning(
                 "Remote offered no allowed codec (offered %s, allowed %s); "
                 "check the codec preference option",
@@ -1269,6 +1458,14 @@ class SipClient:
                 [c.name for c in self._codec_order],
             )
             return False
+        if remote_crypto is not None:
+            if not in_dialog and not answer:
+                self._local_crypto = SdesCrypto(
+                    remote_crypto.tag,
+                    self._local_crypto.key,
+                    self._local_crypto.lifetime,
+                )
+            self._remote_crypto = remote_crypto
         old_ip, old_port = self._remote_rtp_ip, self._remote_rtp_port
         # RFC 2543 hold uses c=0.0.0.0; keep the last real destination.
         if sdp.connection_ip and sdp.connection_ip not in _HOLD_IPS:
@@ -1317,6 +1514,9 @@ class SipClient:
 
     def _begin_dialog_media(self) -> None:
         """Clear per-call media state so the previous dialog cannot leak."""
+        self._local_crypto = SdesCrypto.generate() if self._secure else None
+        self._remote_crypto = None
+        self._srtp_session = None
         self._codec = codecs.fallback(self._codec_order)
         self._awaiting_answer = False
         self._rejected_reinvite = None
@@ -1435,7 +1635,7 @@ class SipClient:
         if with_sdp:
             msg += (
                 "Content-Type: application/sdp\r\n"
-                f"Content-Length: {len(sdp)}\r\n\r\n{sdp}"
+                f"Content-Length: {len(sdp.encode('utf-8'))}\r\n\r\n{sdp}"
             )
         else:
             msg += "Content-Length: 0\r\n\r\n"
@@ -1486,6 +1686,9 @@ class SipClient:
         """Answer an in-dialog re-INVITE without restarting the media session."""
         cseq = _cseq_number(m.header("CSeq"))
         branch = _via_branch(m.header("Via"))
+        if self._secure and self._awaiting_answer:
+            self._send_raw(self._build_response(m, 491, "Request Pending", False))
+            return
         if m.body.strip():
             if not self._apply_remote_sdp(sm.parse_sdp(m.body)):
                 # Dialog state stays untouched (RFC 3261 §12.2.2: the target
@@ -1525,6 +1728,9 @@ class SipClient:
             )
             return
         if m.body.strip():
+            if self._secure and self._awaiting_answer:
+                self._send_raw(self._build_response(m, 491, "Request Pending", False))
+                return
             if not self._apply_remote_sdp(sm.parse_sdp(m.body)):
                 self._reject_media(m)
                 return
@@ -1592,6 +1798,17 @@ class SipClient:
                 )
                 return
             offer = sm.parse_sdp(m.body)
+            if (
+                self._secure
+                and m.body.strip()
+                and self._select_remote_crypto(
+                    offer,
+                    initial=True,
+                )
+                is None
+            ):
+                self._reject_media(m, in_dialog=False)
+                return
             if codecs.choose(offer, self._codec_order) is None:
                 _LOGGER.warning(
                     "Rejecting call from %s: no allowed codec in its offer",
@@ -1616,7 +1833,8 @@ class SipClient:
             self._remote_invite_cseq = self._d_cseq
             self._remote_invite_branch = _via_branch(m.header("Via"))
             self._begin_dialog_media()
-            self._apply_remote_sdp(offer)
+            if not self._secure or m.body.strip():
+                self._apply_remote_sdp(offer)
             self._awaiting_answer = not m.body.strip()
 
             # Check for standard Intercom/Doorbell auto-answer headers
@@ -1653,6 +1871,8 @@ class SipClient:
                 self._send_raw(self._build_response(m, 200, "OK", True))
                 self._spawn(self._start_media())
                 self._emit("on_incoming_call", caller)
+                if self._secure and self._awaiting_answer:
+                    return
                 self._set_state(SipState.IN_CALL)
                 _LOGGER.info("Call auto-answered and connected")
                 self._emit("on_call_connected")
@@ -1668,17 +1888,36 @@ class SipClient:
         if method == "ACK":
             if self._d_call_id and m.header("Call-ID") != self._d_call_id:
                 return
+            if self._secure and (
+                not self._is_current_dialog_request(m)
+                or _cseq_number(m.header("CSeq")) != self._remote_invite_cseq
+            ):
+                return
             # Offerless INVITE/re-INVITE: our 200 was the offer; the answer
             # arrives in the ACK body (RFC 3261 §13.2.1 / §14.1).
             was_offerer = self._awaiting_answer
-            self._awaiting_answer = False
-            if m.body.strip() and not self._apply_remote_sdp(sm.parse_sdp(m.body)):
+            if self._secure:
+                if not was_offerer:
+                    if m.body.strip():
+                        return
+                elif not m.body.strip() or not self._apply_remote_sdp(
+                    sm.parse_sdp(m.body),
+                    answer=True,
+                ):
+                    self._d_cseq += 1
+                    self._send_raw(self._build_in_dialog("BYE"))
+                    self._end_call("security_mismatch")
+                    return
+            elif m.body.strip() and not self._apply_remote_sdp(sm.parse_sdp(m.body)):
                 if was_offerer and self.state in (SipState.ANSWERING, SipState.IN_CALL):
                     _LOGGER.warning("Ending call: the ACK answer has no allowed codec")
                     self._d_cseq += 1
                     self._send_raw(self._build_in_dialog("BYE"))
                     self._end_call("codec_mismatch")
                     return
+            self._awaiting_answer = False
+            if self._secure and was_offerer:
+                self._spawn(self._start_media())
             if self.state == SipState.ANSWERING:
                 self._set_state(SipState.IN_CALL)
                 _LOGGER.info("Call connected (inbound)")
@@ -1786,7 +2025,7 @@ class SipClient:
         elif self.state in (SipState.INVITING, SipState.RINGING_OUT):
             msg = (
                 f"CANCEL {self._d_remote_target} SIP/2.0\r\n"
-                f"Via: SIP/2.0/UDP {self._local_ip}:{self._local_port};branch={self._d_branch};rport\r\n"
+                f"Via: SIP/2.0/{self._via_transport} {self._local_ip}:{self._local_port};branch={self._d_branch};rport\r\n"
                 "Max-Forwards: 70\r\n"
                 f"From: {self._d_local}\r\n"
                 f"To: {self._d_remote}\r\n"
@@ -1826,7 +2065,7 @@ class SipClient:
         )
         return (
             f"{method} {request_uri} SIP/2.0\r\n"
-            f"Via: SIP/2.0/UDP {self._local_ip}:{self._local_port};branch={sm.gen_branch()};rport\r\n"
+            f"Via: SIP/2.0/{self._via_transport} {self._local_ip}:{self._local_port};branch={sm.gen_branch()};rport\r\n"
             "Max-Forwards: 70\r\n"
             f"{route_block}"
             f"From: {self._d_local}\r\n"
@@ -1924,6 +2163,12 @@ class SipClient:
             )
         ended_session = self._media_session
         self._media_session += 1
+        if self._secure:
+            self._local_crypto = None
+            self._remote_crypto = None
+            self._srtp_session = None
+            self._sdp_negotiated = False
+            self._awaiting_answer = False
         self._spawn(self._stop_media_session(ended_session))
         self._set_state(SipState.REGISTERED if self.registered else SipState.IDLE)
         self._emit("on_call_ended", reason)
@@ -1957,6 +2202,10 @@ class SipClient:
         _LOGGER.warning("RTP media timeout")
         self.hangup(reason="media_timeout")
 
+    def _on_media_error(self) -> None:
+        if self.state in (SipState.IN_CALL, SipState.ANSWERING):
+            self.hangup(reason="media_security_error")
+
     # -- media ----------------------------------------------------------
     def _apply_rtp_dest_if_changed(self) -> None:
         """Retarget RTP if SDP moved the peer while a start was in flight."""
@@ -1969,6 +2218,14 @@ class SipClient:
     async def _start_media(self) -> None:
         async with self._media_lock:
             session = self._media_session
+            if self._secure and (
+                self._closing
+                or self.state not in (SipState.IN_CALL, SipState.ANSWERING)
+                or not self._sdp_negotiated
+                or self._local_crypto is None
+                or self._remote_crypto is None
+            ):
+                return
             if self._media_active:
                 # Same dialog: ACK/UPDATE/re-INVITE can schedule a second
                 # start while the first is still binding. Do not bounce RTP.
@@ -1984,7 +2241,23 @@ class SipClient:
             self.rtp.set_remote(self._remote_rtp_ip, self._remote_rtp_port)
             self.rtp.on_audio = self._on_rx_audio
             self.rtp.on_dtmf = self._on_rx_dtmf
-            if not await self.rtp.start(self.config.local_rtp_port):
+            if self._secure:
+                try:
+                    if self._srtp_session is None:
+                        self._srtp_session = SrtpSession(
+                            self._local_crypto, self._remote_crypto
+                        )
+                except Exception:
+                    _LOGGER.warning("Cannot initialize secure media")
+                    self._on_media_error()
+                    return
+                started = await self.rtp.start(
+                    self.config.local_rtp_port,
+                    srtp=self._srtp_session,
+                )
+            else:
+                started = await self.rtp.start(self.config.local_rtp_port)
+            if not started:
                 _LOGGER.warning(
                     "Media not started: RTP port %s unavailable; call has no audio",
                     self.config.local_rtp_port,

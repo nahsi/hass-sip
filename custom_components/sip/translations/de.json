@@ -6,6 +6,7 @@
         "description": "Bitte gib deine SIP-Nebenstellendaten und Serverdetails ein.",
         "data": {
           "server": "SIP-Server / Host",
+          "security_mode": "Verbindungssicherheit",
           "port": "Port",
           "username": "Benutzername / Nebenstelle",
           "password": "Passwort",
@@ -20,6 +21,8 @@
           "use_observed_address": "Vom Server beobachtete Adresse verwenden (NAT)"
         },
         "data_description": {
+          "port": "Leer lassen, um den Standardport des Modus zu verwenden: 5060 für UDP oder 5061 für TLS. Ein angegebener Port bleibt beim Moduswechsel erhalten.",
+          "security_mode": "TLS prüft das Serverzertifikat und den Hostnamen und erfordert mit SRTP verschlüsseltes Audio. Der Server muss beides unterstützen.",
           "use_observed_address": "Aktivieren, wenn Home Assistant zum SIP-Server hinter NAT/SNAT liegt (z. B. eine Firewall, die die Absenderadresse umschreibt) und Anrufe kein Audio haben. Statt der lokalen Schnittstellenadresse wird die vom Server gesehene Adresse (Via received/rport) in Contact und SDP angegeben."
         }
       },
@@ -28,6 +31,7 @@
         "description": "Aktualisiere deine SIP-Nebenstellendaten und Serverdetails. Passwort leer lassen, um das aktuelle zu behalten.",
         "data": {
           "server": "SIP-Server / Host",
+          "security_mode": "Verbindungssicherheit",
           "port": "Port",
           "username": "Benutzername / Nebenstelle",
           "password": "Passwort",
@@ -42,6 +46,8 @@
           "use_observed_address": "Vom Server beobachtete Adresse verwenden (NAT)"
         },
         "data_description": {
+          "port": "Leer lassen, um den Standardport des Modus zu verwenden: 5060 für UDP oder 5061 für TLS. Ein angegebener Port bleibt beim Moduswechsel erhalten.",
+          "security_mode": "TLS prüft das Serverzertifikat und den Hostnamen und erfordert mit SRTP verschlüsseltes Audio. Der Server muss beides unterstützen.",
           "use_observed_address": "Aktivieren, wenn Home Assistant zum SIP-Server hinter NAT/SNAT liegt (z. B. eine Firewall, die die Absenderadresse umschreibt) und Anrufe kein Audio haben. Statt der lokalen Schnittstellenadresse wird die vom Server gesehene Adresse (Via received/rport) in Contact und SDP angegeben."
         }
       }
@@ -352,6 +358,12 @@
     }
   },
   "selector": {
+    "security_mode": {
+      "options": {
+        "udp_rtp": "UDP mit RTP",
+        "tls_srtp": "TLS mit verpflichtendem SRTP"
+      }
+    },
     "codec_preference": {
       "options": {
         "auto": "Automatisch (G.722 → PCMU → PCMA)",

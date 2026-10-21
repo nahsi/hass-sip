@@ -10,6 +10,7 @@ ASSIST_HANGUP_MERGED_TOOL_NAME = f"assist__{ASSIST_HANGUP_TOOL_NAME}"
 # Config fields
 CONF_SERVER = "server"
 CONF_PORT = "port"
+CONF_SECURITY_MODE = "security_mode"
 CONF_USERNAME = "username"
 CONF_PASSWORD = "password"
 CONF_DOMAIN = "domain"

@@ -22,9 +22,12 @@ import os
 import struct
 from typing import Callable
 
+import pylibsrtp
+
 from . import codecs
 from . import trace
 from .codecs import Codec
+from .srtp import SrtpKeyExpired, SrtpSession
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -95,6 +98,8 @@ class RtpSession:
         self._loop = asyncio.get_running_loop()
         self._transport: asyncio.DatagramTransport | None = None
         self._sender_task: asyncio.Task | None = None
+        self._srtp: SrtpSession | None = None
+        self._media_failed = False
 
         self._remote: tuple[str, int] | None = None
         self._sdp_remote: tuple[str, int] | None = None
@@ -130,6 +135,7 @@ class RtpSession:
         self.on_audio: Callable[[bytes], None] | None = None
         self.on_dtmf: Callable[[str], None] | None = None
         self.on_media_timeout: Callable[[], None] | None = None
+        self.on_media_error: Callable[[], None] | None = None
         self.media_timeout: float = 30.0
         self.expect_rx = True
         self._last_rx_at: float | None = None
@@ -261,19 +267,30 @@ class RtpSession:
         return self._transport is not None
 
     # -- lifecycle ------------------------------------------------------
-    async def start(self, local_port: int) -> bool:
+    async def start(self, local_port: int, *, srtp: SrtpSession | None = None) -> bool:
         await self.stop()
+        self._srtp = srtp
+        self._media_failed = False
+        transport = None
+
+        def receive(data: bytes, addr: tuple[str, int]) -> None:
+            if transport is not None and self._transport is transport:
+                self._receive(data, addr)
+
         try:
             transport, _ = await self._loop.create_datagram_endpoint(
-                lambda: _RtpProtocol(self._receive),
+                lambda: _RtpProtocol(receive),
                 local_addr=("0.0.0.0", local_port),
             )
         except OSError as err:
             _LOGGER.warning("RTP bind failed on port %s: %s", local_port, err)
+            self._srtp = None
             return False
         self._transport = transport
 
         self._seq = struct.unpack("<H", os.urandom(2))[0]
+        if srtp is not None:
+            self._seq &= 0x7FFF
         self._timestamp = struct.unpack("<I", os.urandom(4))[0]
         self._ssrc = struct.unpack("<I", os.urandom(4))[0]
         self._first_packet = True
@@ -315,6 +332,7 @@ class RtpSession:
         if self._transport is not None:
             self._transport.close()
             self._transport = None
+        self._srtp = None
         self._tx_buffer.clear()
         self._clear_dtmf_tx()
         self._rx_dtmf_timestamp = -1
@@ -373,17 +391,33 @@ class RtpSession:
             self._ssrc & 0xFFFFFFFF,
         )
 
-    def _send(self, packet: bytes) -> None:
-        if self._transport is not None and self._remote is not None:
-            self._transport.sendto(packet, self._remote)
-            self._note_trace_tx(packet)
+    def _send(self, packet: bytes) -> bool:
+        if self._transport is None or self._remote is None or self._media_failed:
+            return False
+        if self._srtp is not None:
+            try:
+                packet = self._srtp.protect(packet)
+            except (pylibsrtp.Error, ValueError, SrtpKeyExpired):
+                self._fail_media()
+                return False
+        self._transport.sendto(packet, self._remote)
+        self._note_trace_tx(packet)
+        return True
+
+    def _fail_media(self) -> None:
+        if self._media_failed:
+            return
+        self._media_failed = True
+        self.tx_enabled = False
+        _LOGGER.warning("SRTP media protection failed")
+        if self.on_media_error is not None:
+            self.on_media_error()
 
     def _send_audio_packet(self, frame: bytes) -> None:
         header = self._rtp_header(
             self._first_packet, self.payload_type, self._timestamp
         )
-        self._send(header + self._encode(frame))
-        if self._transport is not None and self._remote is not None:
+        if self._send(header + self._encode(frame)):
             self.bytes_sent += len(frame)
         self._seq += 1
         self._timestamp += self._ts_increment
@@ -593,6 +627,16 @@ class RtpSession:
             _LOGGER.exception("Error handling RTP packet (ignored)")
 
     def _receive_impl(self, data: bytes, addr: tuple[str, int] | None = None) -> None:
+        if self._media_failed:
+            return
+        if self._srtp is not None:
+            try:
+                data = self._srtp.unprotect(data)
+            except SrtpKeyExpired:
+                self._fail_media()
+                return
+            except (pylibsrtp.Error, ValueError):
+                return
         if len(data) < 12:
             return
         if data[0] >> 6 != 2:

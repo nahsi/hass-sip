@@ -26,6 +26,8 @@ from custom_components.sip.const import (
     CONF_MAX_CALL_DURATION,
     CONF_MEDIA_TIMEOUT,
     CONF_PASSWORD,
+    CONF_PORT,
+    CONF_SECURITY_MODE,
     CONF_SERVER,
     CONF_USE_OBSERVED_ADDRESS,
     CONF_USERNAME,
@@ -35,6 +37,7 @@ from custom_components.sip.const import (
     DEFAULT_USE_OBSERVED_ADDRESS,
     DOMAIN,
 )
+from custom_components.sip.sip_client.sip_client import SipSecurityMode
 
 from .common import wait_for
 from .mock_pbx import MockPbx
@@ -80,6 +83,7 @@ async def test_user_flow_creates_entry(
     assert result["title"] == "SIP: 1001"
     assert result["data"] == {
         **entry_data,
+        CONF_SECURITY_MODE: SipSecurityMode.UDP_RTP,
         CONF_MEDIA_TIMEOUT: DEFAULT_MEDIA_TIMEOUT,
         CONF_MAX_CALL_DURATION: DEFAULT_MAX_CALL_DURATION,
         CONF_USE_OBSERVED_ADDRESS: DEFAULT_USE_OBSERVED_ADDRESS,
@@ -188,6 +192,93 @@ async def test_user_flow_suggests_free_rtp_port(
         DOMAIN, context={"source": SOURCE_USER}
     )
     assert _schema_default(result, CONF_LOCAL_RTP_PORT) == DEFAULT_LOCAL_RTP_PORT + 2
+
+
+@pytest.mark.parametrize("port", [None, 5060, 5071])
+async def test_reconfigure_security_mode_preserves_account(
+    hass: HomeAssistant,
+    entry_data: dict[str, Any],
+    mock_setup_entry: AsyncMock,
+    port: int | None,
+) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="1001@127.0.0.1",
+        data={**entry_data, CONF_PORT: 5060, CONF_ASSIST_USER: "keep-me"},
+    )
+    entry.add_to_hass(hass)
+    result = await entry.start_reconfigure_flow(hass)
+    form = {
+        CONF_SERVER: entry_data[CONF_SERVER],
+        CONF_USERNAME: entry_data[CONF_USERNAME],
+        CONF_SECURITY_MODE: SipSecurityMode.TLS_SRTP,
+        CONF_PASSWORD: "",
+    }
+    if port != 5060:
+        form[CONF_PORT] = port
+
+    with patch(
+        "custom_components.sip.config_flow.async_validate_sip_registration",
+        return_value=(True, ""),
+    ):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], form)
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert entry.unique_id == "1001@127.0.0.1"
+    assert entry.data[CONF_SECURITY_MODE] == SipSecurityMode.TLS_SRTP
+    assert entry.data[CONF_PORT] == port
+    assert entry.data[CONF_PASSWORD] == entry_data[CONF_PASSWORD]
+    assert entry.data[CONF_ASSIST_USER] == "keep-me"
+    for key, value in entry_data.items():
+        if key != CONF_PORT:
+            assert entry.data[key] == value
+
+
+async def test_user_flow_keeps_security_mode_after_registration_error(
+    hass: HomeAssistant,
+    entry_data: dict[str, Any],
+    mock_setup_entry: AsyncMock,
+) -> None:
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+    form = {key: value for key, value in entry_data.items() if key != CONF_PORT}
+    form[CONF_SECURITY_MODE] = SipSecurityMode.TLS_SRTP
+    with patch(
+        "custom_components.sip.config_flow.async_validate_sip_registration",
+        side_effect=[(False, "timeout"), (True, "")],
+    ):
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], form)
+        assert result["type"] is FlowResultType.FORM
+        assert result["errors"] == {"base": "cannot_connect"}
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                CONF_SERVER: entry_data[CONF_SERVER],
+                CONF_USERNAME: entry_data[CONF_USERNAME],
+                CONF_PASSWORD: entry_data[CONF_PASSWORD],
+            },
+        )
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"][CONF_SECURITY_MODE] == SipSecurityMode.TLS_SRTP
+    assert result["data"].get(CONF_PORT) is None
+
+
+async def test_user_flow_rejects_unknown_security_mode(
+    hass: HomeAssistant,
+    entry_data: dict[str, Any],
+    mock_setup_entry: AsyncMock,
+) -> None:
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+    with pytest.raises(InvalidData):
+        await hass.config_entries.flow.async_configure(
+            result["flow_id"], {**entry_data, CONF_SECURITY_MODE: "tls"}
+        )
+    mock_setup_entry.assert_not_called()
 
 
 async def test_reconfigure_keeps_password_and_assist_user(

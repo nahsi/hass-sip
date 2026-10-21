@@ -6703,7 +6703,7 @@ def test_validate_registration_survives_client_start_failure():
     stopped = []
 
     class FakeClient:
-        def __init__(self, cfg, callbacks):
+        def __init__(self, cfg, callbacks, *, ssl_context=None):
             pass
 
         async def start(self):
@@ -6720,7 +6720,7 @@ def test_validate_registration_survives_client_start_failure():
 
 def test_validate_registration_does_not_hang_on_stuck_stop():
     class FakeClient:
-        def __init__(self, cfg, callbacks):
+        def __init__(self, cfg, callbacks, *, ssl_context=None):
             self.cb = callbacks
 
         async def start(self):
@@ -6739,27 +6739,6 @@ def test_validate_registration_does_not_hang_on_stuck_stop():
 
 
 # ------------------------------------------------------- config_flow schema
-def test_build_schema_new_entry_has_no_prefilled_values():
-    # Matches the original (pre-reconfigure) schema exactly: required fields
-    # start blank, only the fields that always had defaults keep them.
-    schema = config_flow._build_schema(7078)
-    markers = {str(k): k for k in schema.schema}
-    assert markers["server"].default is vol.UNDEFINED
-    assert markers["username"].default is vol.UNDEFINED
-    assert markers["password"].default is vol.UNDEFINED
-    assert markers["authentication_username"].default is vol.UNDEFINED
-    assert markers["port"].default() == config_flow.DEFAULT_PORT
-    assert markers["local_rtp_port"].default() == 7078
-    assert (
-        markers["register_expiration"].default()
-        == config_flow.DEFAULT_REGISTER_EXPIRATION
-    )
-    assert markers["media_timeout"].default() == config_flow.DEFAULT_MEDIA_TIMEOUT
-    assert (
-        markers["max_call_duration"].default() == config_flow.DEFAULT_MAX_CALL_DURATION
-    )
-
-
 def test_build_schema_reconfigure_prefills_current_entry_values():
     current = {
         "server": "pbx.example.com",

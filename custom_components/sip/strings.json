@@ -6,6 +6,7 @@
         "description": "Please enter your SIP extension credentials and server details.",
         "data": {
           "server": "SIP Server / Host",
+          "security_mode": "Connection security",
           "port": "Port",
           "username": "Username / Extension",
           "password": "Password",
@@ -20,6 +21,8 @@
           "use_observed_address": "Use server-observed address (NAT)"
         },
         "data_description": {
+          "port": "Leave empty to use the mode's default port: 5060 for UDP or 5061 for TLS. A specified port is kept when changing modes.",
+          "security_mode": "TLS verifies the server certificate and hostname and requires encrypted audio with SRTP. The server must support both.",
           "use_observed_address": "Enable when Home Assistant is behind NAT/SNAT toward the SIP server (for example a firewall that rewrites the source address) and calls have no audio. The address the server sees (Via received/rport) is advertised in Contact and SDP instead of the local interface address."
         }
       },
@@ -28,6 +31,7 @@
         "description": "Update your SIP extension credentials and server details. Leave the password blank to keep the current one.",
         "data": {
           "server": "SIP Server / Host",
+          "security_mode": "Connection security",
           "port": "Port",
           "username": "Username / Extension",
           "password": "Password",
@@ -42,6 +46,8 @@
           "use_observed_address": "Use server-observed address (NAT)"
         },
         "data_description": {
+          "port": "Leave empty to use the mode's default port: 5060 for UDP or 5061 for TLS. A specified port is kept when changing modes.",
+          "security_mode": "TLS verifies the server certificate and hostname and requires encrypted audio with SRTP. The server must support both.",
           "use_observed_address": "Enable when Home Assistant is behind NAT/SNAT toward the SIP server (for example a firewall that rewrites the source address) and calls have no audio. The address the server sees (Via received/rport) is advertised in Contact and SDP instead of the local interface address."
         }
       }
@@ -352,6 +358,12 @@
     }
   },
   "selector": {
+    "security_mode": {
+      "options": {
+        "udp_rtp": "UDP with RTP",
+        "tls_srtp": "TLS with required SRTP"
+      }
+    },
     "codec_preference": {
       "options": {
         "auto": "Automatic (G.722 → PCMU → PCMA)",

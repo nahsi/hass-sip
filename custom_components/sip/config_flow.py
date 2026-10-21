@@ -19,12 +19,14 @@ from homeassistant.helpers.selector import (
     TextSelectorConfig,
     TextSelectorType,
 )
+from homeassistant.util.ssl import client_context
 
 from .const import (
     LOGGER,
     DOMAIN,
     CONF_SERVER,
     CONF_PORT,
+    CONF_SECURITY_MODE,
     CONF_USERNAME,
     CONF_PASSWORD,
     CONF_DOMAIN,
@@ -33,7 +35,6 @@ from .const import (
     CONF_LOCAL_RTP_PORT,
     CONF_OUTBOUND_PROXY,
     CONF_AUTH_USERNAME,
-    DEFAULT_PORT,
     DEFAULT_REGISTER_EXPIRATION,
     DEFAULT_LOCAL_RTP_PORT,
     CONF_MEDIA_TIMEOUT,
@@ -46,6 +47,7 @@ from .const import (
     DEFAULT_MEDIA_TIMEOUT,
     DEFAULT_MAX_CALL_DURATION,
 )
+from .sip_client.sip_client import SipSecurityMode
 
 
 def _password_selector() -> TextSelector:
@@ -86,7 +88,19 @@ def _build_schema(
     return vol.Schema(
         {
             vol.Required(CONF_SERVER, default=_default(CONF_SERVER)): cv.string,
-            vol.Optional(CONF_PORT, default=_default(CONF_PORT, DEFAULT_PORT)): cv.port,
+            vol.Required(
+                CONF_SECURITY_MODE,
+                default=_default(CONF_SECURITY_MODE, SipSecurityMode.UDP_RTP),
+            ): SelectSelector(
+                SelectSelectorConfig(
+                    options=[mode.value for mode in SipSecurityMode],
+                    mode=SelectSelectorMode.DROPDOWN,
+                    translation_key=CONF_SECURITY_MODE,
+                )
+            ),
+            vol.Optional(CONF_PORT, default=_default(CONF_PORT)): vol.Any(
+                None, cv.port
+            ),
             vol.Required(CONF_USERNAME, default=_default(CONF_USERNAME)): cv.string,
             password_key: _password_selector(),
             vol.Optional(
@@ -178,7 +192,10 @@ async def async_validate_sip_registration(
 
     sip_config = SipConfig(
         server=user_input[CONF_SERVER],
-        port=user_input.get(CONF_PORT, 5060),
+        port=user_input.get(CONF_PORT),
+        security_mode=SipSecurityMode(
+            user_input.get(CONF_SECURITY_MODE, SipSecurityMode.UDP_RTP)
+        ),
         username=user_input[CONF_USERNAME],
         password=user_input[CONF_PASSWORD],
         auth_username=user_input.get(CONF_AUTH_USERNAME, ""),
@@ -219,7 +236,15 @@ async def async_validate_sip_registration(
         sip_config.port,
         sip_config.local_rtp_port,
     )
-    client = SipClient(sip_config, callbacks)
+    client = SipClient(
+        sip_config,
+        callbacks,
+        ssl_context=(
+            client_context()
+            if sip_config.security_mode is SipSecurityMode.TLS_SRTP
+            else None
+        ),
+    )
     try:
         await client.start()
         # Wait up to 5 seconds for registration success/failure
@@ -299,7 +324,9 @@ class SipConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="user",
-            data_schema=_build_schema(_suggested_rtp_port(self.hass)),
+            data_schema=_build_schema(
+                _suggested_rtp_port(self.hass), defaults=user_input
+            ),
             errors=errors,
         )
 
